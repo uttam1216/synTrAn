@@ -1,0 +1,8 @@
+py-staticmaps
+networkx
+osmnx
+matplotlib
+pandas
+numpy
+glob
+shutil
