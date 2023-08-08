@@ -1,0 +1,306 @@
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import LabelEncoder
+import torch.nn as nn
+from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.metrics import classification_report
+
+
+
+# class MyDataset(Dataset):
+#     def __init__(self, data):
+#         self.data = data
+#
+#     def __len__(self):
+#         return len(self.data)
+#
+#     def __getitem__(self, idx):
+#         locs = torch.tensor(self.data.iloc[idx]['location_id'])
+#         times = torch.tensor(self.data.iloc[idx]['timestamp'])
+#         target = torch.tensor(self.data.iloc[idx]['user_id'])
+#         print(locs)
+#         return locs, times, target
+
+
+class MyDataset(Dataset):
+    def __init__(self, data_file,oversample=False):
+        self.data = pd.read_csv(data_file)
+        # initialize label encoder
+        self.label_encoder = LabelEncoder()
+        self.label_encoder.fit(self.data['user_id'])
+
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        locs = []
+        for x in self.data.iloc[idx]['location_id'].split(','):
+
+            try:
+                locs.append(float(x.strip('[]')))
+            except ValueError:
+                pass
+        times = []
+        for x in self.data.iloc[idx]['timestamp'].split(','):
+            try:
+                times.append(float(x.strip()))
+            except ValueError:
+                pass
+        target = self.label_encoder.transform([self.data.iloc[idx]['user_id']])[0]
+        return locs, times, target
+
+    def collate_fn(self, batch):
+        locs_batch, times_batch, target_batch = zip(*batch)
+        max_len = max([len(locs) for locs in locs_batch + times_batch])
+        max_len = 899
+        locs_padded = [locs + [0] * (max_len - len(locs)) for locs in locs_batch]
+        times_padded = [times + [0] * (max_len - len(times)) for times in times_batch]
+        return torch.tensor(locs_padded), torch.tensor(times_padded), torch.tensor(target_batch)
+
+
+# class MyDataset(Dataset):
+#     def __init__(self, data_file):
+#         self.data = pd.read_csv(data_file, dtype={'userid': int, 'location': int, 'timestamp': int})
+#
+#     def __len__(self):
+#         return len(self.data['userid'].unique())
+#
+#     def __getitem__(self, index):
+#         user_id = self.data['userid'].unique()[index]
+#         user_data = self.data[self.data['userid'] == user_id]
+#         locs = user_data['location'].tolist()
+#         times = user_data['timestamp'].tolist()
+#         return torch.tensor(locs), torch.tensor(times), torch.tensor(user_id)
+
+
+# train_data = pd.read_csv('data/train_dataset.csv')
+# test_data = pd.read_csv('data/test_dataset.csv')
+
+# train_dataset = MyDataset(train_data)
+# train_dataset = MyDataset('data/train_dataset.csv')
+# Uncomment
+train_dataset = MyDataset('data/StaticMap/merged_final_train.csv')
+
+train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, collate_fn=train_dataset.collate_fn)
+sample_batch = next(iter(train_loader))
+locs, times, _ = sample_batch
+input_size = len(locs[0]) + len(times[0])
+print(f"Input size: {input_size}")
+
+# test_dataset = MyDataset(test_data)
+test_dataset = MyDataset('data/StaticMap/merged_final_test.csv')
+
+test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False, collate_fn=test_dataset.collate_fn)
+
+privacy_dataset = MyDataset('data/k_anonymity/merged_final_privacy.csv')
+
+privacy_loader = DataLoader(privacy_dataset, batch_size=128, shuffle=True, collate_fn=privacy_dataset.collate_fn)
+
+synthetic_dataset = MyDataset('data/k_anonymity/merged_final_evaluation.csv')
+synthetic_loader = DataLoader(synthetic_dataset, batch_size=32, shuffle=False, collate_fn=synthetic_dataset.collate_fn)
+
+
+#
+# for locs, times, target in eval_loader:
+#     print(locs)
+#     print(times)
+#     print(target)
+
+
+class MyModel(nn.Module):
+    def __init__(self, input_size, num_classes):
+        super(MyModel, self).__init__()
+        self.fc1 = nn.Linear(input_size, 256)  # 100 is the input size
+        self.fc2 = nn.Linear(256, 128)
+        self.fc4 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, num_classes)  # 10 is the number of user_ids
+
+    def forward(self, locs, times):
+        x = torch.cat((locs, times), dim=1)
+        x = self.fc1(x)
+        x = nn.ReLU()(x)
+        x = self.fc2(x)
+        x = nn.ReLU()(x)
+        x = self.fc4(x)
+        x = nn.ReLU()(x)
+        x = self.fc3(x)
+        return x
+
+
+# set up model, loss function, and optimizer
+# input_size = len(train_dataset[0][0]) + len(train_dataset[0][1])
+hidden_size = 64
+num_classes = len(train_dataset.label_encoder.classes_)
+model = MyModel(input_size, num_classes)
+# print(model)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+criterion = nn.CrossEntropyLoss()
+
+
+def test(model, data_loader):
+    model.eval()
+    correct = 0
+    correct_1 = 0
+    total = 0
+    true_labels = []
+    predicted_labels = []
+    with torch.no_grad():
+        for locs, times, target in data_loader:
+            output = model(locs, times)
+            _, predicted = torch.max(output.data, 1)
+            correct_1 += (predicted == target).sum().item()
+            _, predicted_top5 = torch.topk(output, k=5, dim=1)  # Get top 5 predictions
+
+            correct_predictions = predicted_top5.eq(target.view(-1, 1).expand_as(predicted_top5))
+            correct_top5 = correct_predictions.any(dim=1).sum().item()
+            total += target.size(0)
+            correct += correct_top5
+            true_labels.extend(target.tolist())
+            predicted_labels.extend(predicted.tolist())
+
+    accuracy = 100 * correct / total
+    accuracy_1 = (100 * correct_1 / total)
+    macro_precision = precision_score(true_labels, predicted_labels, average='macro')
+
+
+    # Calculate macro recall
+    macro_recall = recall_score(true_labels, predicted_labels, average='macro')
+
+    # Calculate macro F1
+    macro_f1 = f1_score(true_labels, predicted_labels, average='macro')
+    return accuracy, accuracy_1, macro_precision, macro_recall, macro_f1
+
+
+def Synthetic(model, data_loader):
+    model.eval()
+    correct = 0
+    correct_1 = 0
+    total = 0
+    true_labels = []
+    predicted_labels = []
+    with torch.no_grad():
+        for locs, times, target in data_loader:
+            output = model(locs, times)
+            _, predicted = torch.max(output.data, 1)
+            correct_1 += (predicted == target).sum().item()
+            _, predicted_top5 = torch.topk(output, k=5, dim=1)  # Get top 5 predictions
+            correct_predictions = predicted_top5.eq(target.view(-1, 1).expand_as(predicted_top5))
+            correct_top5 = correct_predictions.any(dim=1).sum().item()
+            total += target.size(0)
+            correct += correct_top5
+            true_labels.extend(target.tolist())
+            predicted_labels.extend(predicted.tolist())
+
+    accuracy = 100 * correct / total
+    accuracy_1 = (100 * correct_1 / total)
+    macro_precision = precision_score(true_labels, predicted_labels, average='macro')
+
+    # Calculate macro recall
+    macro_recall = recall_score(true_labels, predicted_labels, average='macro')
+
+    # Calculate macro F1
+    macro_f1 = f1_score(true_labels, predicted_labels, average='macro')
+    return accuracy, accuracy_1, macro_precision, macro_recall, macro_f1
+
+
+best_accuracy = 0.0  # Track the best accuracy achieved during training
+best_train_loss = float('inf')  # Track the best train loss achieved during training
+epochs_without_improvement = 0  # Track the number of epochs without improvement
+max_epochs_without_improvement = 5
+#
+for epoch in range(25):
+    train_loss = 0.0
+    true_labels = []
+    predicted_labels = []
+    model.train()
+    for locs, times, target in train_loader:
+        # print(locs)
+        optimizer.zero_grad()
+        output = model(locs, times)
+        loss = criterion(output, target)
+        loss.backward()
+        optimizer.step()
+        train_loss += loss.item()
+
+    model.eval()
+    correct = 0
+    correct_1 = 0
+    total = 0
+    with torch.no_grad():
+        for locs, times, target in test_loader:
+            # print(locs)
+            output = model(locs, times)
+            _, predicted = torch.max(output.data, 1)
+
+            # total += target.size(0)
+            correct_1 += (predicted == target).sum().item()
+            _, predicted_top5 = torch.topk(output, k=5, dim=1)  # Get top 5 predictions
+            correct_predictions = predicted_top5.eq(target.view(-1, 1).expand_as(predicted_top5))
+            correct_top5 = correct_predictions.any(dim=1).sum().item()
+            total += target.size(0)
+            correct += correct_top5
+            true_labels.extend(target.tolist())
+            predicted_labels.extend(predicted.tolist())
+
+    accuracy = (100 * correct / total)
+    accuracy_1 = (100 * correct_1 / total)
+    # Calculate macro precision
+    macro_precision = precision_score(true_labels, predicted_labels, average='macro')
+    # print(classification_report(true_labels, predicted_labels))
+
+    # Calculate macro recall
+    macro_recall = recall_score(true_labels, predicted_labels, average='macro')
+
+    # Calculate macro F1
+    macro_f1 = f1_score(true_labels, predicted_labels, average='macro')
+    print('Epoch %d: Train loss: %.4f | Test accuracy@5: %.2f%% | Test accuracy@1: %.2f%% | Macro Precision: %.2f%% | '
+          'Macro Recall: %.2f%% | Macro F1 Score: %.2f%%' %
+          (epoch + 1, train_loss / len(train_loader),
+           accuracy, accuracy_1, macro_precision * 100, macro_recall * 100, macro_f1 * 100))
+    # if accuracy > best_accuracy:
+    #     best_accuracy = accuracy
+    #     torch.save(model.state_dict(), 'savedModel/simple_best_model.pth')  # Save the model with the best accuracy
+    if train_loss <= best_train_loss:
+        best_train_loss = train_loss
+        epochs_without_improvement = 0
+        torch.save(model.state_dict(), 'savedModel/simple_best_model.pth')  # Save the model with the best train loss
+    else:
+        epochs_without_improvement += 1
+
+    if epochs_without_improvement >= max_epochs_without_improvement:
+        print("Early stopping triggered. Stopping training.")
+        break
+
+# Load the best model
+# model.load_state_dict(torch.load('savedModel/BestModelfor2ndalgorithm_6_jun/simple_best_model.pth'))
+model.load_state_dict(torch.load('savedModel/simple_best_model.pth'))
+# model.load_state_dict(torch.load('savedModel/secondalgorithm_staticmap/simple_best_model.pth'))
+# Test the best model
+print("##############################################")
+average_synthetic_accuracy_5 = 0.0
+average_privacy_accuracy_5 = 0.0
+average_synthetic_accuracy_1 = 0.0
+average_privacy_accuracy_1 = 0.0
+
+for i in range(5):
+    Synthetic_accuracy_5, Synthetic_accuracy_1, precision, recall, F1 = Synthetic(model, synthetic_loader)
+    average_synthetic_accuracy_5 = average_synthetic_accuracy_5 + Synthetic_accuracy_5
+    average_synthetic_accuracy_1 = average_synthetic_accuracy_1 + Synthetic_accuracy_1
+Synthetic_accuracy_5 = float(average_synthetic_accuracy_5) / float(5.0)
+Synthetic_accuracy_1 = float(average_synthetic_accuracy_1) / float(5.0)
+print('Synthetic Trajectories accuracy@5: %.2f%% | Synthetic Trajectories accuracy@1: %.2f%% | Synthetic Trajectories '
+      'Precision: %.2f%% | Synthetic Trajectories Recall: %.2f%% | Synthetic Trajectories F1 Score: %.2f%%' % (
+          Synthetic_accuracy_5, Synthetic_accuracy_1, precision, recall, F1))
+for i in range(5):
+    privacy_accuracy_5, privacy_accuracy_1, precision, recall, F1 = test(model, privacy_loader)
+    average_privacy_accuracy_5 = average_privacy_accuracy_5 + privacy_accuracy_5
+    average_privacy_accuracy_1 = average_privacy_accuracy_1 + privacy_accuracy_1
+privacy_accuracy_5 = float(average_privacy_accuracy_5) / float(5.0)
+privacy_accuracy_1 = float(average_privacy_accuracy_1) / float(5.0)
+print('Privacy Preservation accuracy@5: %.2f%% | Privacy Preservation accuracy@1: %.2f%% | Privacy Preservation '
+      'Precision: %.2f%% | Privacy Preservation Recall: %.2f%% | Privacy Preservation F1 Score: %.2f%%' % (
+          privacy_accuracy_5, privacy_accuracy_1, precision, recall, F1))
+print("##############################################")
